@@ -1,7 +1,11 @@
+#!/usr/bin/env python3
+"""Evaluate workflow responses against test prompts."""
+
 import json
 import time
 import uuid
 from pathlib import Path
+from typing import Any, Dict, List
 
 from langgraph.types import Command
 
@@ -11,7 +15,8 @@ PROMPTS_PATH = Path(__file__).parent / "eval_prompts.json"
 RESULTS_DIR = Path(__file__).parent / "eval_results"
 
 
-def run_one(case: dict) -> dict:
+def run_one(case: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a single evaluation case."""
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
     started = time.perf_counter()
     result = graph.invoke(
@@ -35,13 +40,17 @@ def run_one(case: dict) -> dict:
 
 
 def main() -> None:
-    cases = json.loads(PROMPTS_PATH.read_text(encoding="utf-8"))
+    """Run all evaluation cases."""
+    cases: List[Dict[str, Any]] = json.loads(
+        PROMPTS_PATH.read_text(encoding="utf-8")
+    )
     RESULTS_DIR.mkdir(exist_ok=True)
     out_path = RESULTS_DIR / f"run_{time.strftime('%Y-%m-%d_%H%M%S')}.jsonl"
 
     with out_path.open("w", encoding="utf-8") as f:
         for i, case in enumerate(cases, 1):
-            print(f"[{i}/{len(cases)}] {case['id']} ({case['tenant_id']})...", flush=True)
+            print(f"[{i}/{len(cases)}] {case['id']} ({case['tenant_id']})...",
+                  flush=True)
             try:
                 record = run_one(case)
             except Exception as exc:
