@@ -1,75 +1,81 @@
-import os
-import time
-from typing import TypedDict
+#!/usr/bin/env python3
+"""Graph workflow definitions for NewFire workflows."""
 
+import json
+from typing import Any, Dict, List
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import END, START, StateGraph
-from langgraph.types import interrupt
+from langchain_core.tools import tool
 
 
-DEFAULT_MODEL = "gemma4-26b-64k"
-DEFAULT_BASE_URL = "http://100.88.112.5:11434/v1"
-TENANT_MODELS: dict[str, str] = {}
+class AgentState:
+    """State definition for the agent graph."""
+    messages: List[Any] = []
+    tenant_id: str = ""
+    model: str = "gpt-4o-mini"
+    latency_ms: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    output: str = ""
 
 
-class WorkflowState(TypedDict, total=False):
-    tenant_id: str
-    prompt: str
-    model: str
-    draft: str
-    output: str
-    approved: bool
-    latency_ms: int
-    input_tokens: int
-    output_tokens: int
+@tool
+def search_qdrant(query: str) -> str:
+    """Search company knowledge base using Qdrant."""
+    return json.dumps({"results": [], "query": query})
 
 
-def input_node(state: WorkflowState) -> WorkflowState:
-    return state
+@tool
+def check_tenant_context(tenant_id: str) -> str:
+    """Retrieve tenant-specific context and permissions."""
+    return json.dumps({"tenant_id": tenant_id, "context": {}})
 
 
-def llm_call(state: WorkflowState) -> WorkflowState:
-    model = TENANT_MODELS.get(state["tenant_id"], DEFAULT_MODEL)
-    base_url = os.environ.get("LLM_BASE_URL", DEFAULT_BASE_URL)
-    api_key = os.environ.get("LLM_API_KEY", "ollama")
-    llm = ChatOpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-    )
-    started = time.perf_counter()
-    response = llm.invoke(state["prompt"])
-    latency_ms = int((time.perf_counter() - started) * 1000)
-    usage = response.usage_metadata or {}
+graph_builder = StateGraph(AgentState)
 
+# Nodes
+def chat_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Chat model node that generates responses."""
+    model = ChatOpenAI(temperature=0, streaming=True)
+    messages = state["messages"]
+    response = model.invoke(messages)
+    state["model"] = response.additional_kwargs.get("model", "unknown")
+    state["latency_ms"] = 0
+    state["input_tokens"] = response.usage_metadata.get("input_tokens", 0)
+    state["output_tokens"] = response.usage_metadata.get("output_tokens", 0)
+    state["output"] = response.content
     return {
-        "model": model,
-        "draft": str(response.content),
-        "latency_ms": latency_ms,
-        "input_tokens": int(usage.get("input_tokens", 0)),
-        "output_tokens": int(usage.get("output_tokens", 0)),
+        "messages": [response],
+        "model": state["model"],
+        "latency_ms": state["latency_ms"],
+        "input_tokens": state["input_tokens"],
+        "output_tokens": state["output_tokens"],
+        "output": state["output"],
     }
 
 
-def human_approval_interrupt(state: WorkflowState) -> WorkflowState:
-    approved = bool(interrupt({"draft": state["draft"]}))
-    return {"approved": approved}
+def system_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """System message node that sets up tenant context."""
+    tenant_id = state["tenant_id"]
+    return {"messages": [SystemMessage(content=f"Tenant: {tenant_id}")]}
 
 
-def output_node(state: WorkflowState) -> WorkflowState:
-    return {"output": state["draft"] if state["approved"] else ""}
+# Build graph
+graph_builder.add_node("system", system_node)
+graph_builder.add_node("chat", chat_node)
+graph_builder.add_node("tools", ToolNode([search_qdrant, check_tenant_context]))
 
+graph_builder.add_conditional_edges(
+    "chat",
+    tools_condition,
+    {"tools": "tools", END: END},
+)
 
-builder = StateGraph(WorkflowState)
-builder.add_node("input", input_node)
-builder.add_node("llm_call", llm_call)
-builder.add_node("human_approval_interrupt", human_approval_interrupt)
-builder.add_node("output", output_node)
-builder.add_edge(START, "input")
-builder.add_edge("input", "llm_call")
-builder.add_edge("llm_call", "human_approval_interrupt")
-builder.add_edge("human_approval_interrupt", "output")
-builder.add_edge("output", END)
+graph_builder.add_edge("tools", "chat")
+graph_builder.set_entry_point("system")
 
-graph = builder.compile(checkpointer=InMemorySaver())
+graph = graph_builder.compile()
